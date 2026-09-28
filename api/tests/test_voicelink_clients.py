@@ -1,0 +1,567 @@
+"""Tests for the VoiceLink reseller client-provisioning service.
+
+The VoiceLink HTTP layer is mocked at the ``_send_request`` seam (same
+pattern as the KYC tests — no network calls), and the DB layer is mocked
+at the ``db_client`` module attribute used by the service.
+"""
+
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+import pytest
+from cryptography.fernet import Fernet
+
+from api.services.voicelink_clients import (
+    VoiceLinkClientError,
+    VoiceLinkClientsClient,
+    derive_username,
+    ensure_voicelink_client,
+    generate_client_password,
+    provision_voicelink_client,
+    resolve_org_owner,
+    split_signup_name,
+    stash_voicelink_signup_secret,
+)
+from api.services.voicelink_clients.secrets import decrypt_provision_secret
+
+API_BASE = "https://app.voicelink.co.in/api"
+_PROVISION_KEY = Fernet.generate_key().decode()
+
+
+def _client(**overrides) -> VoiceLinkClientsClient:
+    kwargs = {
+        "api_base": API_BASE,
+        "username": "reseller-user",
+        "password": "placeholder-password",
+    }
+    kwargs.update(overrides)
+    return VoiceLinkClientsClient(**kwargs)
+
+
+def _ok(data=None, message="ok"):
+    return (201, {"status": True, "message": message, "data": data or {}})
+
+
+# ======== USERNAME / NAME DERIVATION ========
+
+
+def test_derive_username_uses_email_local_part_and_org_suffix():
+    assert derive_username("jane.doe@example.test", 11) == "jane.doe.11"
+
+
+def test_derive_username_strips_unsafe_characters():
+    assert derive_username("jane+spam!{}@example.test", 7) == "janespam.7"
+
+
+def test_derive_username_falls_back_when_local_part_is_unusable():
+    assert derive_username("++@example.test", 3) == "client.3"
+
+
+def test_split_signup_name_splits_first_and_rest():
+    assert split_signup_name("Jane Mary Smith", 5) == ("Jane", "Mary Smith")
+
+
+def test_split_signup_name_falls_back_for_single_token_and_missing():
+    assert split_signup_name("Jane", 5) == ("Jane", "Org5")
+    assert split_signup_name(None, 5) == ("Client", "Org5")
+    assert split_signup_name("   ", 5) == ("Client", "Org5")
+
+
+# ======== CLIENT: CREATE REQUEST SHAPE ========
+
+
+@pytest.mark.asyncio
+async def test_provision_posts_the_expected_create_payload(monkeypatch):
+    monkeypatch.setenv("VOICELINK_DEFAULT_CHANNELS", "3")
+    monkeypatch.setenv("VOICELINK_DEFAULT_INBOUND_RATE", "0.5")
+    monkeypatch.setenv("VOICELINK_DEFAULT_OUTBOUND_RATE", "0.7")
+
+    client = _client()
+    client._access_token = "tok"
+
+    with (
+        patch.object(
+            client,
+            "_send_request",
+            new_callable=AsyncMock,
+            return_value=_ok({"client_id": 474}),
+        ) as send,
+        patch("api.services.voicelink_clients.service.db_client") as db,
+    ):
+        db.update_organization_voicelink = AsyncMock()
+        await provision_voicelink_client(
+            11,
+            email="jane.doe@example.test",
+            password="placeholder-pass",
+            name="Jane Doe",
+            client=client,
+        )
+
+    send.assert_awaited_once()
+    method, url, payload, token = send.await_args.args[:4]
+    assert method == "POST"
+    assert url == f"{API_BASE}/v1/reseller/client/create"
+    assert token == "tok"
+    assert payload == {
+        "first_name": "Jane",
+        "last_name": "Doe",
+        "username": "jane.doe.11",
+        "email": "jane.doe@example.test",
+        "password": "placeholder-pass",
+        "channel_count": 3,
+        "negative_threshold": 0,
+        "pulse_seconds": 60,
+        "inbound_rate": 0.5,
+        "outbound_rate": 0.7,
+    }
+
+
+@pytest.mark.asyncio
+async def test_provision_defaults_channels_and_rates(monkeypatch):
+    monkeypatch.delenv("VOICELINK_DEFAULT_CHANNELS", raising=False)
+    monkeypatch.delenv("VOICELINK_DEFAULT_INBOUND_RATE", raising=False)
+    monkeypatch.delenv("VOICELINK_DEFAULT_OUTBOUND_RATE", raising=False)
+
+    client = _client()
+    client._access_token = "tok"
+
+    with (
+        patch.object(
+            client, "_send_request", new_callable=AsyncMock, return_value=_ok()
+        ) as send,
+        patch("api.services.voicelink_clients.service.db_client") as db,
+    ):
+        db.update_organization_voicelink = AsyncMock()
+        await provision_voicelink_client(
+            11,
+            email="jane@example.test",
+            password="placeholder-pass",
+            client=client,
+        )
+
+    payload = send.await_args_list[0].args[2]  # first call = the create POST
+    assert payload["channel_count"] == 1
+    assert payload["inbound_rate"] == 1.0
+    assert payload["outbound_rate"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_provision_uses_supplied_username_for_retries():
+    client = _client()
+    client._access_token = "tok"
+
+    with (
+        patch.object(
+            client, "_send_request", new_callable=AsyncMock, return_value=_ok()
+        ) as send,
+        patch("api.services.voicelink_clients.service.db_client") as db,
+    ):
+        db.update_organization_voicelink = AsyncMock()
+        await provision_voicelink_client(
+            11,
+            email="jane@example.test",
+            password="placeholder-pass",
+            username="stored.username.11",
+            client=client,
+        )
+
+    assert send.await_args_list[0].args[2]["username"] == "stored.username.11"
+
+
+# ======== OUTCOME PERSISTENCE ========
+
+
+@pytest.mark.asyncio
+async def test_success_stores_provisioned_status_and_client_id():
+    client = _client()
+    client._access_token = "tok"
+
+    with (
+        patch.object(
+            client,
+            "_send_request",
+            new_callable=AsyncMock,
+            return_value=_ok({"client_id": 474}),
+        ),
+        patch("api.services.voicelink_clients.service.db_client") as db,
+    ):
+        db.update_organization_voicelink = AsyncMock()
+        result = await provision_voicelink_client(
+            11,
+            email="jane@example.test",
+            password="placeholder-pass",
+            client=client,
+        )
+
+    assert result["status"] == "provisioned"
+    assert result["client_id"] == "474"
+    # Success clears the provisioning secret (org is now provisioned).
+    db.update_organization_voicelink.assert_awaited_once_with(
+        11,
+        client_id="474",
+        username="jane.11",
+        status="provisioned",
+        error=None,
+        provision_secret=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_422_no_channels_stores_pending_with_error():
+    client = _client()
+    client._access_token = "tok"
+
+    with (
+        patch.object(
+            client,
+            "_send_request",
+            new_callable=AsyncMock,
+            return_value=(
+                422,
+                {"status": False, "message": "No channels available"},
+            ),
+        ),
+        patch("api.services.voicelink_clients.service.db_client") as db,
+    ):
+        db.update_organization_voicelink = AsyncMock()
+        result = await provision_voicelink_client(
+            11,
+            email="jane@example.test",
+            password="placeholder-pass",
+            client=client,
+        )
+
+    assert result["status"] == "pending"
+    assert result["client_id"] is None
+    assert "No channels available" in result["error"]
+
+    update_kwargs = db.update_organization_voicelink.await_args.kwargs
+    assert update_kwargs["status"] == "pending"
+    assert update_kwargs["error"] == "No channels available"
+    assert update_kwargs["username"] == "jane.11"
+    # Existing client_id is preserved — a failed retry must not wipe it.
+    assert "client_id" not in update_kwargs
+
+
+@pytest.mark.asyncio
+async def test_pending_stores_encrypted_provision_secret(monkeypatch):
+    # On failure we keep an encrypted copy of the password so a later admin
+    # "Create client" can reuse the same platform password.
+    monkeypatch.setenv("VOICELINK_PROVISION_KEY", _PROVISION_KEY)
+
+    client = _client()
+    client._access_token = "tok"
+
+    with (
+        patch.object(
+            client,
+            "_send_request",
+            new_callable=AsyncMock,
+            return_value=(
+                422,
+                {"status": False, "message": "No channels available"},
+            ),
+        ),
+        patch("api.services.voicelink_clients.service.db_client") as db,
+    ):
+        db.update_organization_voicelink = AsyncMock()
+        await provision_voicelink_client(
+            11,
+            email="jane@example.test",
+            password="platform-pass-xyz",
+            client=client,
+        )
+
+    secret = db.update_organization_voicelink.await_args.kwargs["provision_secret"]
+    assert secret is not None
+    assert decrypt_provision_secret(secret) == "platform-pass-xyz"
+
+
+@pytest.mark.asyncio
+async def test_create_client_raises_with_upstream_status_code():
+    client = _client()
+    client._access_token = "tok"
+
+    with patch.object(
+        client,
+        "_send_request",
+        new_callable=AsyncMock,
+        return_value=(422, {"status": False, "message": "No channels available"}),
+    ):
+        with pytest.raises(VoiceLinkClientError, match="No channels available") as exc:
+            await client.create_client({"username": "u"})
+
+    assert exc.value.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_list_clients_returns_the_data_list():
+    client = _client()
+    client._access_token = "tok"
+
+    with patch.object(
+        client,
+        "_send_request",
+        new_callable=AsyncMock,
+        return_value=(
+            200,
+            {
+                "status": True,
+                "message": "Success",
+                "data": [{"id": 474, "username": "hardikk.client"}],
+            },
+        ),
+    ) as send:
+        result = await client.list_clients()
+
+    method, url, _payload, token = send.await_args.args[:4]
+    assert method == "GET"
+    assert url == f"{API_BASE}/v1/reseller/clients"
+    assert token == "tok"
+    assert result == [{"id": 474, "username": "hardikk.client"}]
+
+
+@pytest.mark.asyncio
+async def test_list_clients_raises_on_upstream_failure():
+    client = _client()
+    client._access_token = "tok"
+
+    with patch.object(
+        client,
+        "_send_request",
+        new_callable=AsyncMock,
+        return_value=(500, {"status": False, "message": "boom"}),
+    ):
+        with pytest.raises(VoiceLinkClientError):
+            await client.list_clients()
+
+
+# ======== SIGNUP HOOK (stash secret only — provisioning is lazy) ========
+
+
+@pytest.mark.asyncio
+async def test_signup_stash_skips_admin_emails():
+    # Admin/owner orgs are never VoiceLink clients — no provision, no secret.
+    with (
+        patch(
+            "api.services.voicelink_clients.service.is_admin_email",
+            return_value=True,
+        ),
+        patch(
+            "api.services.voicelink_clients.service.provision_voicelink_client",
+            new_callable=AsyncMock,
+        ) as provision,
+        patch("api.services.voicelink_clients.service.db_client") as db,
+    ):
+        db.update_organization_voicelink = AsyncMock()
+        await stash_voicelink_signup_secret(
+            organization_id=11,
+            email="owner@example.test",
+            password="placeholder-pass",
+        )
+
+    provision.assert_not_awaited()
+    db.update_organization_voicelink.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_signup_stash_stores_secret_and_never_provisions(monkeypatch):
+    # Signup must NOT create a VoiceLink client (lazy provisioning does that
+    # later) — only the encrypted platform password is stored.
+    monkeypatch.setenv("VOICELINK_PROVISION_KEY", _PROVISION_KEY)
+    with (
+        patch(
+            "api.services.voicelink_clients.service.provision_voicelink_client",
+            new_callable=AsyncMock,
+        ) as provision,
+        patch("api.services.voicelink_clients.service.db_client") as db,
+    ):
+        db.update_organization_voicelink = AsyncMock()
+        await stash_voicelink_signup_secret(
+            organization_id=11,
+            email="user@example.test",
+            password="platform-pass-xyz",
+        )
+
+    provision.assert_not_awaited()
+    update = db.update_organization_voicelink.await_args
+    assert update.args == (11,)
+    # ONLY the secret is written — no status/client_id churn at signup.
+    assert set(update.kwargs) == {"provision_secret"}
+    # The standard default is stored (NOT the user's signup password, which is
+    # never forwarded to VoiceLink).
+    assert decrypt_provision_secret(update.kwargs["provision_secret"]) == (
+        "12345678"
+    )
+
+
+@pytest.mark.asyncio
+async def test_signup_stash_noop_when_provision_key_unset(monkeypatch):
+    monkeypatch.delenv("VOICELINK_PROVISION_KEY", raising=False)
+    with patch("api.services.voicelink_clients.service.db_client") as db:
+        db.update_organization_voicelink = AsyncMock()
+        await stash_voicelink_signup_secret(
+            organization_id=11,
+            email="user@example.test",
+            password="platform-pass-xyz",
+        )
+
+    db.update_organization_voicelink.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_signup_stash_never_raises(monkeypatch):
+    monkeypatch.setenv("VOICELINK_PROVISION_KEY", _PROVISION_KEY)
+    with patch("api.services.voicelink_clients.service.db_client") as db:
+        db.update_organization_voicelink = AsyncMock(
+            side_effect=RuntimeError("boom")
+        )
+        # Must not raise — signup never fails on VoiceLink errors.
+        await stash_voicelink_signup_secret(
+            organization_id=11,
+            email="user@example.test",
+            password="placeholder-pass",
+        )
+
+
+# ======== PASSWORD / OWNER RESOLUTION ========
+
+
+def test_generate_client_password_returns_configured_default():
+    from api.services.voicelink_clients.service import default_client_password
+
+    pw = generate_client_password()
+    assert isinstance(pw, str) and pw
+    # Standardized on a single known default (not random) so the owner can
+    # reveal/hand it out from the admin panel.
+    assert pw == default_client_password() == generate_client_password()
+
+
+def test_resolve_org_owner_prefers_signup_owner():
+    owner = SimpleNamespace(id=5, provider_id="p1", email="jane@x.test")
+    other = SimpleNamespace(id=2, provider_id="p2", email="other@x.test")
+    org = SimpleNamespace(provider_id="org_p1", users=[other, owner])
+    assert resolve_org_owner(org) is owner
+
+
+def test_resolve_org_owner_falls_back_to_earliest_member():
+    a = SimpleNamespace(id=9, provider_id="pa", email="a@x.test")
+    b = SimpleNamespace(id=3, provider_id="pb", email="b@x.test")
+    org = SimpleNamespace(provider_id="org_none", users=[a, b])
+    assert resolve_org_owner(org) is b
+
+
+def test_resolve_org_owner_none_when_no_members():
+    assert resolve_org_owner(SimpleNamespace(provider_id="org_x", users=[])) is None
+
+
+# ======== ensure_voicelink_client (idempotent) ========
+
+
+@pytest.mark.asyncio
+async def test_ensure_noop_when_already_provisioned():
+    org = SimpleNamespace(
+        id=11, voicelink_client_id="474", voicelink_username="jane.11"
+    )
+    with (
+        patch("api.services.voicelink_clients.service.db_client") as db,
+        patch(
+            "api.services.voicelink_clients.service.provision_voicelink_client",
+            new_callable=AsyncMock,
+        ) as prov,
+    ):
+        db.get_organization_with_users = AsyncMock(return_value=org)
+        result = await ensure_voicelink_client(11, client=_client())
+
+    assert result["status"] == "provisioned"
+    assert result["client_id"] == "474"
+    prov.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ensure_skips_when_reseller_unconfigured():
+    org = SimpleNamespace(
+        id=11, voicelink_client_id=None, voicelink_username=None
+    )
+    with patch("api.services.voicelink_clients.service.db_client") as db:
+        db.get_organization_with_users = AsyncMock(return_value=org)
+        result = await ensure_voicelink_client(
+            11, client=_client(username="", password="")
+        )
+
+    assert result["client_id"] is None
+    assert result["error"] == "reseller_credentials_unset"
+
+
+@pytest.mark.asyncio
+async def test_ensure_skips_admin_owner():
+    owner = SimpleNamespace(
+        id=1, provider_id="p1", email="owner@admin.test", name="Owner"
+    )
+    org = SimpleNamespace(
+        id=11,
+        voicelink_client_id=None,
+        voicelink_username=None,
+        voicelink_provision_secret=None,
+        provider_id="org_p1",
+        users=[owner],
+    )
+    with (
+        patch("api.services.voicelink_clients.service.db_client") as db,
+        patch(
+            "api.services.voicelink_clients.service.is_admin_email",
+            return_value=True,
+        ),
+        patch(
+            "api.services.voicelink_clients.service.provision_voicelink_client",
+            new_callable=AsyncMock,
+        ) as prov,
+    ):
+        db.get_organization_with_users = AsyncMock(return_value=org)
+        result = await ensure_voicelink_client(11, client=_client())
+
+    assert result["error"] == "admin_owner_uses_reseller_account"
+    prov.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ensure_provisions_when_missing():
+    owner = SimpleNamespace(
+        id=1, provider_id="p1", email="jane@x.test", name="Jane Doe"
+    )
+    org = SimpleNamespace(
+        id=11,
+        voicelink_client_id=None,
+        voicelink_username="jane.11",
+        voicelink_provision_secret=None,
+        provider_id="org_p1",
+        users=[owner],
+    )
+    with (
+        patch("api.services.voicelink_clients.service.db_client") as db,
+        patch(
+            "api.services.voicelink_clients.service.is_admin_email",
+            return_value=False,
+        ),
+        patch(
+            "api.services.voicelink_clients.service.provision_voicelink_client",
+            new_callable=AsyncMock,
+        ) as prov,
+    ):
+        db.get_organization_with_users = AsyncMock(return_value=org)
+        prov.return_value = {
+            "status": "provisioned",
+            "client_id": "900",
+            "username": "jane.11",
+            "error": None,
+        }
+        result = await ensure_voicelink_client(11, client=_client())
+
+    assert result["client_id"] == "900"
+    prov.assert_awaited_once()
+    assert prov.await_args.args[0] == 11
+    assert prov.await_args.kwargs["email"] == "jane@x.test"
+    assert prov.await_args.kwargs["username"] == "jane.11"
+    assert prov.await_args.kwargs["password"]  # a generated password was passed
+
+

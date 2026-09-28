@@ -1,0 +1,232 @@
+import { type ClassValue, clsx } from "clsx"
+import { twMerge } from "tailwind-merge"
+
+import { getAuthUserApiV1UserAuthUserGet } from "@/client/sdk.gen";
+import { getWorkflowCountApiV1WorkflowCountGet } from "@/client/sdk.gen";
+import { impersonateApiV1SuperuserImpersonatePost } from "@/client/sdk.gen";
+
+export function cn(...inputs: ClassValue[]) {
+  return twMerge(clsx(inputs))
+}
+
+export function getRandomId() {
+  return Math.floor(Math.random() * 10_000);
+}
+
+export function getNextNodeId(existingNodes: { id: string }[]): string {
+  const numericIds = existingNodes
+    .map(node => parseInt(node.id, 10))
+    .filter(id => !isNaN(id));
+
+  const maxId = numericIds.length > 0 ? Math.max(...numericIds) : 0;
+  return String(maxId + 1);
+}
+
+export function debounce<T extends (...args: unknown[]) => unknown>(func: T, wait: number): (...args: Parameters<T>) => void {
+  let timeout: NodeJS.Timeout | null = null;
+
+  return function (...args: Parameters<T>) {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+
+    timeout = setTimeout(() => {
+      func(...args);
+    }, wait);
+  };
+}
+
+export async function getRedirectUrl(token: string, permissions: { id: string }[] = []) {
+  console.log('[getRedirectUrl] Called with:', {
+    hasToken: !!token,
+    tokenLength: token?.length,
+    permissionsCount: permissions.length,
+    permissions: permissions.map(p => p.id)
+  });
+  try {
+    console.log('[getRedirectUrl] Calling getAuthUserApiV1UserAuthUserGet...');
+    const authUser = await getAuthUserApiV1UserAuthUserGet({
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    });
+    console.log('[getRedirectUrl] Auth user response:', {
+      hasData: !!authUser.data,
+      isSuperuser: authUser.data?.is_superuser,
+      userId: authUser.data?.id
+    });
+    if (authUser.data?.is_superuser) {
+      console.log('[getRedirectUrl] User is superuser, redirecting to /superadmin');
+      return "/superadmin";
+    }
+
+    const hasAdminPermission = permissions.some(p => p.id === 'admin');
+    console.log('[getRedirectUrl] Admin permission check:', { hasAdminPermission });
+
+  // If the user doesn't have admin permissions, redirect them to
+  // usage page
+  if (!hasAdminPermission) {
+    console.log('[getRedirectUrl] No admin permission, redirecting to /usage');
+    return "/usage";
+  }
+
+  // Check if user has any workflows
+  try {
+    console.log('[getRedirectUrl] Checking for existing workflows...');
+    const countResponse = await getWorkflowCountApiV1WorkflowCountGet({
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    });
+
+    console.log('[getRedirectUrl] Found workflows:', {
+      total: countResponse.data?.total,
+      active: countResponse.data?.active
+    });
+
+    if (countResponse.data && countResponse.data.active > 0) {
+      console.log('[getRedirectUrl] User has workflows, redirecting to /workflow');
+      return "/workflow";
+    } else {
+      console.log('[getRedirectUrl] No workflows found, redirecting to /workflow/create');
+      return "/workflow/create";
+    }
+  } catch (error) {
+    console.error('[getRedirectUrl] Error checking workflows:', error);
+    // If we can't check workflows, default to /workflow/create
+    console.log('[getRedirectUrl] Defaulting to /workflow/create due to error');
+    return "/workflow/create";
+  }
+  } catch (error) {
+    console.error("[getRedirectUrl] Failed to fetch auth user:", error);
+    // Re-throw the error so the caller can handle it
+    throw error;
+  }
+}
+
+
+/**
+ * Centralised impersonation logic to avoid code duplication between pages.
+ *
+ * It performs the super-admin impersonate request, sets the cross-sub-domain
+ * refresh cookie and optionally redirects the browser to the supplied path.
+ */
+export async function impersonateAsSuperadmin(params: {
+  accessToken: string;
+  userId?: number;
+  providerUserId?: string;
+  redirectPath?: string;
+  /**
+   * If true the browser opens the impersonated session in a **new tab**
+   * (via `window.open`). Defaults to `false` which navigates in the current tab.
+   */
+  openInNewTab?: boolean;
+}): Promise<void> {
+  const { accessToken, userId, providerUserId, redirectPath, openInNewTab = false } = params;
+
+  // Build request body depending on which identifier we have.
+  const body: Record<string, unknown> = {};
+  if (userId !== undefined) {
+    body.user_id = userId;
+  }
+  if (providerUserId !== undefined) {
+    body.provider_user_id = providerUserId;
+  }
+
+  if (Object.keys(body).length === 0) {
+    throw new Error('Either userId or providerUserId must be provided');
+  }
+
+  const resp = await impersonateApiV1SuperuserImpersonatePost({
+    body,
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+    },
+  });
+
+  // ---------------------------------------------------------------------------------
+  // Local (OSS email/password) auth mode: the backend returns
+  // `{provider: "local", access_token, user}` instead of a Stack session. The
+  // generated client types predate the `provider` field, hence the cast.
+  // Local sessions live in the browser-wide `dograh_auth_token` cookie (no
+  // per-sub-domain scoping like Stack), so impersonation REPLACES the current
+  // superadmin session: set the cookie via the session route and hard-redirect.
+  // ---------------------------------------------------------------------------------
+  const localData = resp.data as
+    | { provider?: string; access_token?: string; user?: Record<string, unknown> }
+    | undefined;
+  if (localData?.provider === 'local') {
+    if (!localData.access_token) {
+      throw new Error('No access token returned from impersonate');
+    }
+    // Stash the admin's OWN session before overwriting it, so the
+    // impersonation banner can restore it. localStorage survives the
+    // same-origin hard redirect to '/'. /api/auth/oss reads the httpOnly
+    // cookies server-side and returns the admin { token, user }.
+    try {
+      const adminResp = await fetch('/api/auth/oss');
+      if (adminResp.ok) {
+        const admin = await adminResp.json();
+        const clientLabel =
+          (localData.user?.email as string | undefined) ||
+          (localData.user?.name as string | undefined) ||
+          'client account';
+        localStorage.setItem(
+          'dograh_admin_session',
+          JSON.stringify({ token: admin.token, user: admin.user, clientLabel }),
+        );
+      }
+    } catch {
+      // If stashing fails the impersonation still works; the banner just
+      // won't offer a one-click return (admin can log in again).
+    }
+    const sessionResp = await fetch('/api/auth/session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        token: localData.access_token,
+        user: localData.user ?? null,
+      }),
+    });
+    if (!sessionResp.ok) {
+      throw new Error('Failed to store the impersonated session');
+    }
+    window.location.href = '/';
+    return;
+  }
+
+  const refreshToken = resp.data?.refresh_token;
+  if (!refreshToken) {
+    throw new Error('No refresh token returned from impersonate');
+  }
+
+  // ---------------------------------------------------------------------------------
+  // Instead of setting the cookie here (which would also affect the superadmin
+  // sub-domain), redirect the browser to the dedicated impersonation helper route
+  // (served from the target sub-domain, e.g. app.dograh.com). The route will set the
+  // cookie for the *current* sub-domain only and then forward the user to the final
+  // destination.
+  // ---------------------------------------------------------------------------------
+
+  // Determine the base URL that should handle the impersonation cookie. If we are on
+  // superadmin.dograh.com we want to switch to app.dograh.com. For any other domain
+  // (e.g. localhost, staging, or already on the app) we just keep the same origin.
+  const appBaseUrl = window.location.origin.includes('superadmin.')
+    ? window.location.origin.replace('superadmin.', 'app.')
+    : window.location.origin;
+
+  const finalRedirect = redirectPath ?? '/workflow';
+
+  // Build the redirect URL to the helper route, passing along the refresh token and
+  // the final destination.
+  const impersonateUrl = `${appBaseUrl}/impersonate?refresh_token=${encodeURIComponent(
+    refreshToken,
+  )}&redirect_path=${encodeURIComponent(finalRedirect)}`;
+
+  if (openInNewTab) {
+    window.open(impersonateUrl, '_blank');
+  } else {
+    window.location.href = impersonateUrl;
+  }
+}
+
